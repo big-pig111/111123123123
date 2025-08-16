@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: tg-bot-webhook
+    env: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node index.webhook.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TRADER_PRIVATE_KEY
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+
+
