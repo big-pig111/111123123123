@@ -1,0 +1,16 @@
+{
+  "name": "pumpu-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "main": "index.webhook.js",
+  "scripts": {
+    "start": "node index.webhook.js",
+    "start:local": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "ethers": "^6.15.0",
+    "telegraf": "^4.16.3"
+  }
+}
