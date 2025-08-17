@@ -49,11 +49,117 @@ await bot.telegram.getMe().then((me) => { BOT_USERNAME = me.username }).catch(()
 // State
 const subscribedUsers = new Set()
 const userPushPrefs = new Map() // userId -> { requireMediaLink: boolean, mcUsdThreshold: number|null, lang: 'en'|'zh' }
+
+// 新增：市值提醒功能
+const marketCapAlerts = new Map() // tokenAddr -> { lastPushed: timestamp, users: Set<userId> }
+const MC_CHECK_INTERVAL = 5 * 60 * 1000 // 5分钟检查一次市值
+let lastMcCheck = 0
+
 function getPrefs(id) {
   if (!userPushPrefs.has(id)) userPushPrefs.set(id, { requireMediaLink: false, mcUsdThreshold: null, lang: 'en' })
   return userPushPrefs.get(id)
 }
 function setLang(id, lang) { getPrefs(id).lang = (lang === 'zh' ? 'zh' : 'en') }
+
+// 新增：市值检查函数
+async function checkMarketCapAlerts() {
+  const now = Date.now()
+  if (now - lastMcCheck < MC_CHECK_INTERVAL) return
+  lastMcCheck = now
+  
+  console.log('🔍 检查市值提醒...')
+  
+  for (const [tokenAddr, alertData] of marketCapAlerts) {
+    try {
+      // 获取代币信息
+      const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider)
+      const [totalSupply, decimals] = await Promise.all([
+        token.totalSupply().catch(() => 0n),
+        token.decimals().catch(() => 18)
+      ])
+      
+      // 获取价格信息（通过池子）
+      let priceInWOKB = null
+      try {
+        const PAIR_ABI = [
+          'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+          'function token0() view returns (address)',
+          'function token1() view returns (address)'
+        ]
+        const pair = new ethers.Contract(tokenAddr, PAIR_ABI, provider)
+        const [reserve0, reserve1] = await pair.getReserves()
+        const token0 = await pair.token0()
+        const token1 = await pair.token1()
+        
+        if (token0.toLowerCase() === WOKB_ADDR.toLowerCase()) {
+          if (reserve1 > 0n) {
+            priceInWOKB = Number(ethers.formatEther(reserve0)) / Number(ethers.formatEther(reserve1))
+          }
+        } else if (token1.toLowerCase() === WOKB_ADDR.toLowerCase()) {
+          if (reserve0 > 0n) {
+            priceInWOKB = Number(ethers.formatEther(reserve1)) / Number(ethers.formatEther(reserve0))
+          }
+        }
+      } catch (e) {
+        console.log(`无法获取 ${tokenAddr} 价格:`, e.message)
+        continue
+      }
+      
+      if (!priceInWOKB) continue
+      
+      // 计算市值（假设 1 WOKB = $1，实际应该查询真实价格）
+      const supplyFloat = Number(ethers.formatUnits(totalSupply, decimals))
+      const marketCapUSD = supplyFloat * priceInWOKB
+      
+      console.log(`代币 ${tokenAddr} 当前市值: $${marketCapUSD.toFixed(2)}`)
+      
+      // 检查每个用户的阈值
+      for (const userId of alertData.users) {
+        try {
+          const prefs = getPrefs(userId)
+          if (prefs.mcUsdThreshold && marketCapUSD >= prefs.mcUsdThreshold) {
+            // 发送市值提醒
+            const lang = prefs.lang
+            const symbol = await token.symbol().catch(() => 'Unknown')
+            
+            const alertText = lang === 'zh' 
+              ? `🚨 <b>市值提醒</b>\n\n代币: ${symbol}\n合约: <code>${tokenAddr}</code>\n当前市值: <b>$${marketCapUSD.toFixed(2)}</b>\n您的阈值: <b>$${prefs.mcUsdThreshold}</b>\n\n💡 代币市值已达到您设定的提醒阈值！`
+              : `🚨 <b>Market Cap Alert</b>\n\nToken: ${symbol}\nContract: <code>${tokenAddr}</code>\nCurrent MC: <b>$${marketCapUSD.toFixed(2)}</b>\nYour threshold: <b>$${prefs.mcUsdThreshold}</b>\n\n💡 Token market cap has reached your alert threshold!`
+            
+            await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'HTML' })
+            console.log(`已发送市值提醒给用户 ${userId}: ${symbol} 市值 $${marketCapUSD.toFixed(2)}`)
+          }
+        } catch (e) {
+          console.log(`发送市值提醒给用户 ${userId} 失败:`, e.message)
+        }
+      }
+      
+    } catch (e) {
+      console.log(`检查代币 ${tokenAddr} 市值失败:`, e.message)
+    }
+  }
+}
+
+// 新增：添加代币到市值提醒列表
+function addToMarketCapAlerts(tokenAddr, userId) {
+  if (!marketCapAlerts.has(tokenAddr)) {
+    marketCapAlerts.set(tokenAddr, { lastPushed: Date.now(), users: new Set() })
+  }
+  marketCapAlerts.get(tokenAddr).users.add(userId)
+  console.log(`用户 ${userId} 已订阅代币 ${tokenAddr} 的市值提醒`)
+}
+
+// 新增：移除代币的市值提醒
+function removeFromMarketCapAlerts(tokenAddr, userId) {
+  if (marketCapAlerts.has(tokenAddr)) {
+    const alertData = marketCapAlerts.get(tokenAddr)
+    alertData.users.delete(userId)
+    if (alertData.users.size === 0) {
+      marketCapAlerts.delete(tokenAddr)
+      console.log(`代币 ${tokenAddr} 的市值提醒已完全移除`)
+    }
+  }
+}
 
 // UI helpers
 function securityHeader(lang) {
@@ -80,6 +186,116 @@ function showMenu(ctx) {
   })
 }
 
+// 新增：推送过滤设置界面
+async function showPushFilters(ctx) {
+  const prefs = getPrefs(ctx.from.id)
+  const lang = prefs.lang
+  
+  // 新增：显示当前市值提醒数量
+  let alertCount = 0
+  for (const [tokenAddr, alertData] of marketCapAlerts) {
+    if (alertData.users.has(ctx.from.id)) {
+      alertCount++
+    }
+  }
+  const alertText = lang === 'zh' ? `市值提醒: ${alertCount} 个代币` : `MC alerts: ${alertCount} tokens`
+  
+  const mediaText = lang === 'zh' ? (prefs.requireMediaLink ? '已开启' : '已关闭') : (prefs.requireMediaLink ? 'On' : 'Off')
+  const mcText = prefs.mcUsdThreshold ? `$${prefs.mcUsdThreshold}` : (lang === 'zh' ? '未设置' : 'Not set')
+  const title = lang === 'zh' ? '当前过滤：' : 'Current filters:'
+  const body = lang === 'zh' 
+    ? `媒体链接要求: ${mediaText}\n市值阈值: ${mcText}\n${alertText}`
+    : `Require media link: ${mediaText}\nMC threshold: ${mcText}\n${alertText}`
+  
+  return ctx.reply(`${title}\n${body}`, {
+    reply_markup: { inline_keyboard: [
+      [ { text: prefs.requireMediaLink ? (lang === 'zh' ? '关闭媒体链接要求' : 'Disable media link requirement') : (lang === 'zh' ? '开启媒体链接要求' : 'Enable media link requirement'), callback_data: 'pf_media' } ],
+      [ { text: lang === 'zh' ? '设置市值阈值' : 'Set MC threshold', callback_data: 'pf_mc_set' }, { text: lang === 'zh' ? '清除市值阈值' : 'Clear MC threshold', callback_data: 'pf_mc_clear' } ],
+      [ { text: lang === 'zh' ? '📊 管理市值提醒' : '📊 Manage MC Alerts', callback_data: 'pf_manage_alerts' } ],
+      [ { text: lang === 'zh' ? '⬅️ 返回' : '⬅️ Back', callback_data: 'm_back' } ]
+    ] }
+  })
+}
+
+// 新增：市值提醒管理界面
+async function showMarketCapAlerts(ctx) {
+  const userId = ctx.from.id
+  const lang = getPrefs(userId).lang
+  
+  // 获取用户订阅的代币列表
+  const userAlerts = []
+  for (const [tokenAddr, alertData] of marketCapAlerts) {
+    if (alertData.users.has(userId)) {
+      userAlerts.push({ addr: tokenAddr, lastPushed: alertData.lastPushed })
+    }
+  }
+  
+  if (userAlerts.length === 0) {
+    const text = lang === 'zh' 
+      ? '📊 市值提醒管理\n\n您还没有订阅任何代币的市值提醒。\n\n💡 设置市值阈值后，新推送的代币会自动添加到提醒列表。'
+      : '📊 Market Cap Alerts Management\n\nYou haven\'t subscribed to any token alerts yet.\n\n💡 After setting a market cap threshold, newly pushed tokens will be automatically added to the alert list.'
+    
+    return ctx.reply(text, {
+      reply_markup: { inline_keyboard: [
+        [ { text: lang === 'zh' ? '⬅️ 返回' : '⬅️ Back', callback_data: 'pf_back' } ]
+      ] }
+    })
+  }
+  
+  // 显示用户订阅的代币列表
+  let text = lang === 'zh' 
+    ? `📊 市值提醒管理\n\n您当前订阅了 ${userAlerts.length} 个代币的市值提醒：\n\n`
+    : `📊 Market Cap Alerts Management\n\nYou are currently subscribed to ${userAlerts.length} token alerts:\n\n`
+  
+  // 最多显示10个代币，避免消息过长
+  const displayAlerts = userAlerts.slice(0, 10)
+  for (let i = 0; i < displayAlerts.length; i++) {
+    const alert = displayAlerts[i]
+    const timeAgo = Math.floor((Date.now() - alert.lastPushed) / 1000 / 60) // 分钟
+    const timeText = lang === 'zh' 
+      ? `${timeAgo} 分钟前`
+      : `${timeAgo} min ago`
+    
+    text += `${i + 1}. <code>${alert.addr.slice(0, 8)}...</code> (${timeText})\n`
+  }
+  
+  if (userAlerts.length > 10) {
+    text += lang === 'zh' 
+      ? `\n... 还有 ${userAlerts.length - 10} 个代币`
+      : `\n... and ${userAlerts.length - 10} more tokens`
+  }
+  
+  text += lang === 'zh' 
+    ? '\n\n💡 系统会每5分钟检查一次市值，达到阈值时自动推送提醒。'
+    : '\n\n💡 The system checks market cap every 5 minutes and automatically sends alerts when thresholds are reached.'
+  
+  const buttons = []
+  
+  // 添加移除提醒的按钮（最多5个）
+  const removeButtons = []
+  for (let i = 0; i < Math.min(5, userAlerts.length); i++) {
+    const alert = userAlerts[i]
+    removeButtons.push({ 
+      text: `${i + 1}`, 
+      callback_data: `remove_alert_${alert.addr}` 
+    })
+  }
+  if (removeButtons.length > 0) {
+    buttons.push(removeButtons)
+  }
+  
+  // 添加其他按钮
+  buttons.push([
+    { text: lang === 'zh' ? '🗑️ 清空所有提醒' : '🗑️ Clear All Alerts', callback_data: 'clear_all_alerts' },
+    { text: lang === 'zh' ? '⬅️ 返回' : '⬅️ Back', callback_data: 'pf_back' }
+  ])
+  
+  return ctx.reply(text, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buttons }
+  })
+}
+
 // Commands
 bot.start(async (ctx) => {
   subscribedUsers.add(ctx.from.id)
@@ -92,10 +308,39 @@ bot.command('lang', (ctx) => {
   return showMenu(ctx)
 })
 
+// 新增：手动检查市值提醒状态
+bot.command('mc_status', async (ctx) => {
+  try {
+    const userId = ctx.from.id
+    const prefs = getPrefs(userId)
+    const lang = prefs.lang
+    
+    let alertCount = 0
+    for (const [tokenAddr, alertData] of marketCapAlerts) {
+      if (alertData.users.has(userId)) {
+        alertCount++
+      }
+    }
+    
+    const thresholdText = prefs.mcUsdThreshold 
+      ? `$${prefs.mcUsdThreshold}`
+      : (lang === 'zh' ? '未设置' : 'Not set')
+    
+    const statusText = lang === 'zh'
+      ? `📊 市值提醒状态\n\n阈值: ${thresholdText}\n订阅代币数: ${alertCount}\n检查间隔: 5分钟\n\n💡 系统会自动监控代币市值，达到阈值时推送提醒。`
+      : `📊 Market Cap Alert Status\n\nThreshold: ${thresholdText}\nSubscribed tokens: ${alertCount}\nCheck interval: 5 minutes\n\n💡 The system automatically monitors token market caps and sends alerts when thresholds are reached.`
+    
+    await ctx.reply(statusText)
+  } catch (e) {
+    await ctx.reply(`❌ 获取状态失败: ${e.message || e}`)
+  }
+})
+
 // Callbacks
 bot.on('callback_query', async (ctx) => {
   const data = ctx.callbackQuery?.data
   const prefs = getPrefs(ctx.from.id)
+  
   if (data === 'm_lang') {
     await ctx.answerCbQuery()
     return ctx.reply(prefs.lang === 'zh' ? '请选择语言：' : 'Choose language:', {
@@ -112,26 +357,61 @@ bot.on('callback_query', async (ctx) => {
   }
   if (data === 'm_filters') {
     await ctx.answerCbQuery()
-    const media = prefs.lang === 'zh' ? (prefs.requireMediaLink ? '已开启' : '已关闭') : (prefs.requireMediaLink ? 'On' : 'Off')
-    const mc = prefs.mcUsdThreshold ? `$${prefs.mcUsdThreshold}` : (prefs.lang === 'zh' ? '未设置' : 'Not set')
-    const title = prefs.lang === 'zh' ? '当前过滤：' : 'Current filters:'
-    return ctx.reply(`${title}\n${prefs.lang === 'zh' ? '媒体链接要求' : 'Require media link'}: ${media}\n${prefs.lang === 'zh' ? '市值阈值' : 'MC threshold'}: ${mc}`, {
-      reply_markup: { inline_keyboard: [
-        [ { text: prefs.requireMediaLink ? (prefs.lang === 'zh' ? '关闭媒体链接要求' : 'Disable media requirement') : (prefs.lang === 'zh' ? '开启媒体链接要求' : 'Enable media requirement'), callback_data: 'pf_media' } ],
-        [ { text: prefs.lang === 'zh' ? '设置市值阈值' : 'Set MC threshold', callback_data: 'pf_mc_set' }, { text: prefs.lang === 'zh' ? '清除市值阈值' : 'Clear MC threshold', callback_data: 'pf_mc_clear' } ],
-        [ { text: prefs.lang === 'zh' ? '⬅️ 返回' : '⬅️ Back', callback_data: 'm_back' } ]
-      ] }
-    })
+    return showPushFilters(ctx)
   }
-  if (data === 'pf_media') { prefs.requireMediaLink = !prefs.requireMediaLink; await ctx.answerCbQuery('OK'); return showMenu(ctx) }
-  if (data === 'pf_mc_set') { await ctx.answerCbQuery(); return ctx.reply(prefs.lang === 'zh' ? '请输入市值阈值（USD，整数）' : 'Enter MC threshold in USD (integer):', { reply_markup: { force_reply: true } }) }
-  if (data === 'pf_mc_clear') { prefs.mcUsdThreshold = null; await ctx.answerCbQuery('OK'); return showMenu(ctx) }
+  if (data === 'pf_media') { 
+    prefs.requireMediaLink = !prefs.requireMediaLink; 
+    await ctx.answerCbQuery('OK'); 
+    return showPushFilters(ctx) 
+  }
+  if (data === 'pf_mc_set') { 
+    await ctx.answerCbQuery(); 
+    return ctx.reply(prefs.lang === 'zh' ? '请输入市值阈值（USD，整数）' : 'Enter MC threshold in USD (integer):', { reply_markup: { force_reply: true } }) 
+  }
+  if (data === 'pf_mc_clear') { 
+    prefs.mcUsdThreshold = null; 
+    await ctx.answerCbQuery('OK'); 
+    return showPushFilters(ctx) 
+  }
+  if (data === 'pf_manage_alerts') {
+    await ctx.answerCbQuery()
+    return showMarketCapAlerts(ctx)
+  }
+  if (data === 'pf_back') {
+    await ctx.answerCbQuery()
+    return showPushFilters(ctx)
+  }
+  if (data === 'm_back') { 
+    await ctx.answerCbQuery(); 
+    return showMenu(ctx) 
+  }
+  // 处理移除单个提醒
+  if (data.startsWith('remove_alert_')) {
+    const tokenAddr = data.replace('remove_alert_', '')
+    removeFromMarketCapAlerts(tokenAddr, ctx.from.id)
+    await ctx.answerCbQuery('已移除提醒')
+    return showMarketCapAlerts(ctx)
+  }
+  // 处理清空所有提醒
+  if (data === 'clear_all_alerts') {
+    for (const [tokenAddr, alertData] of marketCapAlerts) {
+      alertData.users.delete(ctx.from.id)
+      if (alertData.users.size === 0) {
+        marketCapAlerts.delete(tokenAddr)
+      }
+    }
+    await ctx.answerCbQuery('已清空所有提醒')
+    return showMarketCapAlerts(ctx)
+  }
   if (data === 'm_status') {
     await ctx.answerCbQuery()
     const latest = await provider.getBlockNumber().catch(() => 0)
     return ctx.reply(`Watcher on\nFactory: ${PUMPU_FACTORY}\nLatest block: ${latest}\nSubscribers: ${subscribedUsers.size}`)
   }
-  if (data === 'm_back') { await ctx.answerCbQuery(); return showMenu(ctx) }
+  if (data === 'm_analyze') {
+    await ctx.answerCbQuery()
+    return ctx.reply(prefs.lang === 'zh' ? '请输入要分析的 Token 合约地址：' : 'Enter token contract address to analyze:', { reply_markup: { force_reply: true } })
+  }
   await ctx.answerCbQuery()
 })
 
@@ -139,16 +419,44 @@ bot.on('callback_query', async (ctx) => {
 bot.on('message', async (ctx, next) => {
   const reply = ctx.message?.reply_to_message
   if (!reply) return next()
+  
   const prefs = getPrefs(ctx.from.id)
   const n = Number((ctx.message.text || '').trim())
   if (!Number.isFinite(n) || n <= 0) return ctx.reply(prefs.lang === 'zh' ? '请输入正整数' : 'Please enter a positive integer')
+  
   prefs.mcUsdThreshold = Math.floor(n)
-  return showMenu(ctx)
+  
+  // 新增：设置阈值后，自动将已推送的代币添加到提醒列表
+  let addedCount = 0
+  for (const [tokenAddr, alertData] of marketCapAlerts) {
+    if (!alertData.users.has(ctx.from.id)) {
+      addToMarketCapAlerts(tokenAddr, ctx.from.id)
+      addedCount++
+    }
+  }
+  
+  let message = prefs.lang === 'zh' 
+    ? `已设置市值阈值: $${prefs.mcUsdThreshold}`
+    : `MC threshold set: $${prefs.mcUsdThreshold}`
+  
+  if (addedCount > 0) {
+    message += prefs.lang === 'zh'
+      ? `\n已自动订阅 ${addedCount} 个已推送代币的市值提醒`
+      : `\nAutomatically subscribed to ${addedCount} pushed tokens for MC alerts`
+  }
+  
+  await ctx.reply(message)
+  return showPushFilters(ctx)
 })
 
 // Real-time watcher (no backfill)
 let lastProcessed = 0
 const sentKeys = new Set()
+
+// 启动市值检查定时器
+setInterval(() => checkMarketCapAlerts(), MC_CHECK_INTERVAL)
+console.log(`市值提醒检查已启动，间隔: ${MC_CHECK_INTERVAL/1000}秒`)
+
 provider.on('block', async (bn) => {
   try {
     if (!lastProcessed) lastProcessed = bn - 1
@@ -217,6 +525,11 @@ provider.on('block', async (bn) => {
                   `Twitter: ${tw}`,
                 ]
             await bot.telegram.sendMessage(uid, lines.join('\n'), { parse_mode: 'HTML' })
+            
+            // 新增：自动添加到市值提醒列表
+            if (prefs.mcUsdThreshold) {
+              addToMarketCapAlerts(addr, uid)
+            }
           } catch {}
         }
       } catch {}
